@@ -1,0 +1,42 @@
+name: Setup Rails Project
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  setup-rails:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+    
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+      
+      - name: Install Rails
+        run: gem install rails
+      
+      - name: Create Rails app
+        run: |
+          mkdir -p /tmp/keep
+          mv specs/todo-app/spec .
+          rails new . --force --skip-git --skip-test --skip-ci
+          bundle add rspec-rails --group "development, test"
+          bundle add capybara --group "development, test"
+          bundle add factory_bot_rails --group "test"
+          bundle add selenium-webdriver --group "test"
+          rails generate rspec:install
+          rm -rf specs
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "Initialize Rails application"
+          git push

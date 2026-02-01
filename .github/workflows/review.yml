@@ -1,0 +1,117 @@
+name: Run Task Spec
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+  id-token: write
+
+jobs:
+  run-spec:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract task number from branch name
+        id: extract_task
+        run: |
+          BRANCH_NAME="${{ github.head_ref }}"
+          TASK=$(echo "$BRANCH_NAME" | grep -oP 'task_\d+' || echo "")
+          if [ -z "$TASK" ]; then
+            echo "::error::ブランチ名に 'task_数字' の形式が見つかりません"
+            echo "::error::現在のブランチ名: $BRANCH_NAME"
+            exit 1
+          fi
+          echo "task=$TASK" >> $GITHUB_OUTPUT
+          echo "Detected task: $TASK"
+
+      - name: Check if spec file exists
+        id: check_spec
+        run: |
+          TASK="${{ steps.extract_task.outputs.task }}"
+          # サブディレクトリも含めて task_X*_spec.rb を検索
+          SPEC_FILES=$(find spec -type f -name "${TASK}*_spec.rb")
+
+          if [ -z "$SPEC_FILES" ]; then
+            echo "::error::Specファイルが見つかりません: ${TASK}*_spec.rb"
+            echo "::error::利用可能なspecファイル:"
+            find spec -type f -name "*_spec.rb" || echo "specファイルが存在しません"
+            exit 1
+          fi
+
+          echo "spec_files=$SPEC_FILES" >> $GITHUB_OUTPUT
+          echo "::notice::実行するspecファイル:"
+          echo "$SPEC_FILES"
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4.5"
+          bundler-cache: true
+
+      - name: Setup Database
+        run: |
+          bundle exec rails db:create RAILS_ENV=test
+          bundle exec rails db:schema:load RAILS_ENV=test
+        env:
+          RAILS_ENV: test
+
+      - name: Run specific spec
+        id: rspec
+        run: |
+          echo "======================================"
+          echo "実行するspec:"
+          echo "${{ steps.check_spec.outputs.spec_files }}"
+          echo "======================================"
+          # 複数ファイルを一括で実行
+          if bundle exec rspec ${{ steps.check_spec.outputs.spec_files }} --format json --out tmp/rspec_results.json; then                                           
+            echo "result=succeeded" >> $GITHUB_OUTPUT                                                                                       
+          else                                                                                                                                                       
+            echo "result=failed" >> $GITHUB_OUTPUT                                                                                                                  
+          fi    
+        env:
+          RAILS_ENV: test
+
+      - name: Export PR number
+        run: |
+          mkdir -p tmp
+          echo "${{ github.event.pull_request.number }}" > tmp/pr_number.txt
+
+      - name: Upload RSpec results
+        if: always()
+        uses: actions/upload-artifact@v5.0.0
+        with:
+          name: rspec-results
+          path: tmp/rspec_results.json
+          if-no-files-found: error
+
+      - name: Check artifact exists
+        if: always()
+        run: ls -l tmp/
+
+      - name: Upload PR number as artifact
+        if: always()
+        uses: actions/upload-artifact@v5.0.0
+        with:
+          name: pr-number
+          path: tmp/pr_number.txt
+          if-no-files-found: error
+
+      - name: Mark workflow as completed
+        if: always()
+        run: |
+          echo "CI workflow completed (status: ${{ job.status }})"
+
+  claude_review:
+    needs: [run-spec]
+    if: always()
+    uses: ./.github/workflows/claude-code-review.yml
+    secrets: inherit
+    with:
+      pr_number: ${{ github.event.pull_request.number }}

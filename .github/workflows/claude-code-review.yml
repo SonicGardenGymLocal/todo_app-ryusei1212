@@ -1,0 +1,269 @@
+name: Claude Rspec Review
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        required: true
+        type: string
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+  id-token: write
+
+jobs:
+  claude_rspec_review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download artifacts from CI
+        uses: actions/download-artifact@v4
+        with:
+          name: rspec-results
+          path: tmp
+
+      - name: Check artifact exists
+        # (変更なし)
+        run: |
+          if [ ! -f tmp/rspec_results.json ]; then
+            echo "❌ RSpec結果ファイル (tmp/rspec_results.json) が見つかりません。"
+            echo "CIワークフロー (ci.yml) の 'test' ジョブで、RSpec実行時に '--format json --out tmp/rspec_results.json' が指定されているか、"
+            echo "また 'Upload RSpec results' ステップが正しく実行されているか確認してください。"
+            exit 1
+          fi
+          echo "✅ RSpec結果ファイル (tmp/rspec_results.json) が見つかりました。"
+
+      - name: Get PR number
+        id: pr
+        run: |
+          if [ -z "${{ inputs.pr_number }}" ]; then
+            echo "❌ input から PR番号が渡されませんでした。"
+            exit 1
+          fi
+          echo "pr_number=${{ inputs.pr_number }}" >> $GITHUB_OUTPUT
+
+      - name: Read RSpec JSON for prompt injection
+        id: read_rspec
+        run: |
+          # (変更なし)
+          if [ ! -s tmp/rspec_results.json ]; then
+            echo "⚠️ RSpec結果ファイル (tmp/rspec_results.json) が空です。テストが実行されなかったか、JSONフォーマッタに問題がある可能性があります。"
+            # 空のJSONオブジェクトを渡して、Claude側で「指摘なし」と判断させます。
+            echo "json_content={}" >> $GITHUB_OUTPUT
+          else
+            # (変更なし)
+            content=$(cat tmp/rspec_results.json | jq -c . | jq -r tostring)
+            if [ $? -ne 0 ]; then
+                echo "❌ RSpec JSONのパースに失敗しました。ファイルが破損しているか、不正な形式です。"
+                echo "json_content={}" >> $GITHUB_OUTPUT
+            else
+                echo "json_content=$content" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Run Claude Code
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            # (プロンプト内容は変更なし)
+            # コードレビューガイドライン
+
+            あなたは熟練のRubyエンジニアです。
+            以下のRSpec実行結果(JSON形式)を読み取り、
+            どのテストが失敗しているか、そしてその失敗原因がどのファイル・行・メソッドに起因していそうかを推測してください。
+
+            ---
+            ## 🚫 禁止事項
+            - 絶対に**具体的なコード例や修正コード**を出力しないでください。
+            - レビューコメントは常に**抽象的な指摘や方向性**に留めてください。
+
+            ---
+            ## 🧐 レビュー方針
+            - コードの正誤を中心に考察する。
+            - 「失敗の根本原因（ロジック・メソッド呼び出し・バリデーションなど）」をコメントにまとめる。
+            - スタイルやフォーマットの話題は不要。
+            - 以下の `tmp/rspec_results.json` の内容を参照し、失敗テストの情報を抽出・分析する。
+
+            ---
+            ## 🧾 出力フォーマット（この形式を厳守）
+            - あなたの最終出力は、必ず以下のテキストにしてください。
+            - もしコードに指摘事項がない場合は、「結論: success」のみを出力してください。
+              例：
+                - 結論: success
+                - レビュー結果:
+                    ---
+                    file: app/controllers/posts_controller.rb
+                    line: 12
+                    comment: createアクションでストロングパラメータが定義されていますが使用されていません。
+
+                    ---
+                    file: app/controllers/posts_controller.rb
+                    line: 25
+                    comment: 保存処理のエラーハンドリングが不足しています。saveがfalseの場合の処理を追加してください。
+
+                    ---
+                    file: app/controllers/posts_controller.rb
+                    line: 42
+                    comment: showアクションでパラメータ名が誤っています。
+
+            ---
+            ## ✅ 結論
+            - コードが動いていたらsuccess, 失敗していたらfailureのテキストを返してください。
+            - 各指摘を「file」「line」「comment」形式で出力してください。
+
+            ---
+            ## 参考データ
+            ```json
+            ${{ steps.read_rspec.outputs.json_content }}
+            ```
+
+      - name: Extract and Comment PR Review
+        uses: actions/github-script@v7
+        # 変更点: `env:` を追加して RSpec のJSONを環境変数経由で渡します
+        env:
+          RSPEC_JSON_CONTENT: ${{ steps.read_rspec.outputs.json_content }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const prNumberStr = '${{ steps.pr.outputs.pr_number }}';
+            if (!prNumberStr) {
+              console.log("PR番号がステップ出力から取得できませんでした。'Get PR number' ステップが失敗していないか確認してください。");
+              return;
+            }
+            const prNumber = parseInt(prNumberStr, 10);
+            if (isNaN(prNumber)) {
+              console.log(`取得したPR番号 '${prNumberStr}' が数値ではありません。`);
+              return;
+            }
+
+            // (変更なし)
+            const executionFile = '${{ steps.claude.outputs.execution_file }}';
+            if (!fs.existsSync(executionFile)) {
+              console.log(`Claudeの実行ファイルが見つかりません: ${executionFile}`);
+              return;
+            }
+
+            const executionLog = JSON.parse(fs.readFileSync(executionFile, 'utf8'));
+
+            let comments = [];
+            let claudeOutput = "";
+
+            for (let i = executionLog.length - 1; i >= 0; i--) {
+              const logEntry = executionLog[i];
+              // (変更なし)
+              const message = logEntry.message;
+              if (message && message.role === 'assistant') {
+                const content = message.content;
+                const textParts = content
+                  .filter(part => part.type === 'text' && typeof part.text === 'string' && part.text.trim().length > 0)
+                  .map(part => part.text);
+
+                if (textParts.length > 0) {
+                  claudeOutput = textParts.join('\n\n');
+                  const regex = /[-–—]{3,}[\r\n]+[\s-]*file:\s*(.+)[\r\n]+[\s-]*line:\s*(\d+)[\r\n]+[\s-]*comment:\s*([\s\S]*?)(?=(?:[-–—]{3,}|$))/g;
+                  let match;
+                  while ((match = regex.exec(claudeOutput)) !== null) {
+                    const [_, file, line, body] = match;
+                    comments.push({
+                      path: file.trim(),
+                      line: parseInt(line.trim(), 10),
+                      body: body.trim()
+                    });
+                  }
+                  break;
+                }
+              }
+            }
+
+            // (変更なし)
+            const conclusionRegex = /(?:結論|conclusion)\s*[:：]\s*(\w+)/i;
+            const conclusionMatch = claudeOutput.match(conclusionRegex);
+            const isSuccess = conclusionMatch && conclusionMatch[1].toLowerCase() === 'success';
+
+            if (comments.length === 0) {
+              // 変更点: 環境変数から RSpec JSON を取得します
+              const rspecJsonContent = process.env.RSPEC_JSON_CONTENT || "{}";
+              const body = isSuccess
+                ? "### Claude 自動コードレビュー結果\n\nコードに問題は見つかりませんでした。お疲れ様でした! (結論: success)"
+                : `### Claude 自動コードレビュー結果\n\n失敗が検出されましたが、具体的なコメントはありませんでした。\n(RSpecのJSON結果を確認してください)\n\n\`\`\`json\n${rspecJsonContent}\n\`\`\``;
+
+              // (変更なし)
+              github.rest.issues.createComment({
+                issue_number: prNumber,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: body
+              });
+              return;
+            }
+
+            // (変更なし)
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+              event: "COMMENT",
+              body: "### Claude 自動コードレビュー結果\n\n以下のファイルにコメントを投稿しました。",
+              comments
+            });
+
+      - name: Parse Claude Execution File and Check Conclusion
+        id: parse_and_fail
+        run: |
+          # (変更なし)
+          EXECUTION_FILE="${{ steps.claude.outputs.execution_file }}"
+          if [ ! -f "$EXECUTION_FILE" ]; then
+            echo "⚠️ Claude実行ファイルが見つかりません: $EXECUTION_FILE"
+            exit 1
+          fi
+
+          # (変更なし)
+          RESULT_TEXT=$(cat "$EXECUTION_FILE" | jq -r '.[] | select(.message.role=="assistant") | .message.content[] | select(.type=="text") | .text' | tail -n 20)
+
+          if [ -z "$RESULT_TEXT" ]; then
+             echo "⚠️ Claudeの出力テキストが取得できませんでした。"
+             RESULT_TEXT=$(cat "$EXECUTION_FILE" | jq -r '.[] | select(.type=="result") | .result')
+          fi
+
+          if [ -z "$RESULT_TEXT" ]; then
+             echo "❌ Claudeの出力 (assistant role または result type) が見つかりません。"
+             exit 1
+          fi
+
+          echo "--- Claudeの出力（末尾）---"
+          echo "$RESULT_TEXT"
+          echo "-------------------------"
+
+          # (変更なし)
+          CONCLUSION=$(echo "$RESULT_TEXT" | grep -Eo '(結論|conclusion)\s*[:：]\s*(success|failure)' | grep -Eo '(success|failure)' | tail -n 1)
+
+          if [ "$CONCLUSION" = "failure" ]; then
+            echo "🔴 レビュー結果が 'failure' です。このジョブを失敗としてマークします。"
+            exit 1
+          elif [ "$CONCLUSION" = "success" ]; then
+            echo "🟢 レビュー結果が 'success' です。処理を続行します。"
+          else
+            echo "⚠️ 結論の値が 'success' または 'failure' ではありませんでした。"
+            echo "検出された結論: '$CONCLUSION'"
+            echo "RSpecの結果JSONを確認してください。"
+            exit 1
+          fi
